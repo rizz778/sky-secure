@@ -1,1 +1,4 @@
 .env
+.zoho_tokens.json
+__pycache__/
+*.py[cod]
