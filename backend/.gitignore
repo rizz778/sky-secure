@@ -1,4 +1,6 @@
 .env
 .zoho_tokens.json
+.session_memory.json
+.user_memory.json
 __pycache__/
 *.py[cod]

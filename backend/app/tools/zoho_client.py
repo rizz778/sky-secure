@@ -181,6 +181,71 @@ async def zoho_request(path: str, params: dict[str, Any] | None = None) -> dict[
     }
 
 
+async def zoho_send(
+    method: str,
+    path: str,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    tokens = load_tokens()
+    api_domain = projects_api_domain(tokens)
+    if not api_domain:
+        raise HTTPException(
+            status_code=401,
+            detail="Zoho Projects API domain is missing. Visit /auth/login first.",
+        )
+
+    access_token = await get_access_token()
+    url = f"{api_domain}{path}"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}",
+    }
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        response = await client.request(method, url, headers=headers, params=params, json=json_body)
+
+    body = parse_zoho_error(response) if response.is_error else parse_zoho_response(response)
+    response_data = {
+        "body": body,
+        "is_error": response.is_error,
+        "path": path,
+        "status_code": response.status_code,
+        "url": str(response.url),
+    }
+    if response.is_error:
+        raise HTTPException(status_code=response.status_code, detail=body)
+    return response_data
+
+
+async def create_task(portal_id: str, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return await zoho_send(
+        "POST",
+        f"/api/v3/portal/{portal_id}/projects/{project_id}/tasks",
+        json_body=payload,
+    )
+
+
+async def update_task(
+    portal_id: str,
+    project_id: str,
+    task_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return await zoho_send(
+        "PATCH",
+        f"/api/v3/portal/{portal_id}/projects/{project_id}/tasks/{task_id}",
+        json_body=payload,
+    )
+
+
+async def delete_task(portal_id: str, project_id: str, task_id: str) -> dict[str, Any]:
+    return await zoho_send(
+        "DELETE",
+        f"/api/v3/portal/{portal_id}/projects/{project_id}/tasks/{task_id}",
+    )
+
+
 async def get_portals() -> dict[str, Any]:
     return await zoho_get("/api/v3/portals")
 
