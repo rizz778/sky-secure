@@ -12,6 +12,7 @@ class ChatRequest(BaseModel):
     user_id: str | None = None
     portal_id: str | None = None
     project_id: str | None = None
+    task_id: str | None = None
     confirmation: bool | None = None
 
 
@@ -23,5 +24,6 @@ async def chat(request: ChatRequest):
         user_id=request.user_id,
         portal_id=request.portal_id,
         project_id=request.project_id,
+        task_id=request.task_id,
         confirmation=request.confirmation,
     )

@@ -1,3 +1,4 @@
+
 import json
 import os
 import re
@@ -5,13 +6,13 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import HTTPException
-from google import genai
+from mistralai.client import Mistral
 
 from app.tools.zoho_agent_tools import list_portals, list_projects, list_tasks
 
 load_dotenv()
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
 MAX_TOOL_OUTPUT_CHARS = 12000
 
 QUERY_TOOLS = {
@@ -47,30 +48,35 @@ async def decide_query_tool(
     portal_id: str | None = None,
     project_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    client = gemini_client()
-    response = await client.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=(
-            "Choose the best Zoho read tool for this request.\n\n"
-            "Tools:\n"
-            "- list_portals(): list available portals.\n"
-            "- list_projects(portal_id): list projects in a portal.\n"
-            "- list_tasks(portal_id, project_id): list tasks in a project.\n\n"
-            "Return valid JSON only:\n"
-            "{\"tool_name\":\"list_tasks\",\"tool_input\":{\"portal_id\":\"...\",\"project_id\":\"...\"}}\n\n"
-            f"User request: {message}\n"
-            f"Known portal_id: {portal_id}\n"
-            f"Known project_id: {project_id}"
-        ),
-        config={
-            "system_instruction": (
-                "You route user questions to read-only Zoho tools. "
-                "Never choose create, update, or delete actions."
-            )
-        },
+    client = mistral_client()
+    response = await client.chat.complete_async(
+        model=MISTRAL_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You route user questions to read-only Zoho tools. "
+                    "Never choose create, update, or delete actions. "
+                    "Return valid JSON only with {\"tool_name\":\"list_tasks\",\"tool_input\":{\"portal_id\":\"...\",\"project_id\":\"...\"}}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Choose the best Zoho read tool for this request.\n\n"
+                    "Tools:\n"
+                    "- list_portals(): list available portals.\n"
+                    "- list_projects(portal_id): list projects in a portal.\n"
+                    "- list_tasks(portal_id, project_id): list tasks in a project.\n\n"
+                    f"User request: {message}\n"
+                    f"Known portal_id: {portal_id}\n"
+                    f"Known project_id: {project_id}"
+                ),
+            },
+        ],
     )
 
-    parsed = parse_json_object(response.text or "")
+    parsed = parse_json_object(response.choices[0].message.content)
     tool_name = parsed.get("tool_name") or fallback_tool_name(message)
     if tool_name not in QUERY_TOOLS:
         tool_name = fallback_tool_name(message)
@@ -93,25 +99,31 @@ async def answer_from_tool_output(
     tool_input: dict[str, Any],
     tool_output: Any,
 ) -> str:
-    client = gemini_client()
+    client = mistral_client()
     tool_output_text = json.dumps(tool_output, indent=2, default=str)[:MAX_TOOL_OUTPUT_CHARS]
 
-    response = await client.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=(
-            f"User request:\n{message}\n\n"
-            f"Tool used: {tool_name}\n"
-            f"Tool input: {json.dumps(tool_input, default=str)}\n"
-            f"Tool output JSON:\n{tool_output_text}"
-        ),
-        config={
-            "system_instruction": (
-                "You are a Zoho Project Assistant. Answer only from the tool output. "
-                "If an ID is missing, ask for it clearly. Keep answers concise and practical."
-            )
-        },
+    response = await client.chat.complete_async(
+        model=MISTRAL_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a Zoho Project Assistant. Answer only from the tool output. "
+                    "If an ID is missing, ask for it clearly. Keep answers concise and practical."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"User request:\n{message}\n\n"
+                    f"Tool used: {tool_name}\n"
+                    f"Tool input: {json.dumps(tool_input, default=str)}\n"
+                    f"Tool output JSON:\n{tool_output_text}"
+                ),
+            },
+        ],
     )
-    return response.text or ""
+    return response.choices[0].message.content or ""
 
 
 def fill_known_ids(
@@ -179,8 +191,8 @@ def parse_json_object(text: str) -> dict[str, Any]:
             return {}
 
 
-def gemini_client():
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_api_key:
-        raise HTTPException(status_code=500, detail="Missing GEMINI_API_KEY in backend/.env")
-    return genai.Client(api_key=gemini_api_key)
+def mistral_client():
+    mistral_api_key = os.getenv("MISTRAL_API_KEY")
+    if not mistral_api_key:
+        raise HTTPException(status_code=500, detail="Missing MISTRAL_API_KEY in backend/.env")
+    return Mistral(api_key=mistral_api_key)

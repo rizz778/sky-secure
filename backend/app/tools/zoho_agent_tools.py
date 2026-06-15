@@ -1,4 +1,7 @@
+import datetime
 from typing import Any
+
+from dateutil import parser
 
 from app.tools.zoho_client import (
     create_task as zoho_create_task,
@@ -22,6 +25,16 @@ async def list_tasks(portal_id: str, project_id: str) -> Any:
     return await get_tasks(portal_id, project_id)
 
 
+def normalize_due_date(due_date: str | None) -> str | None:
+    if not due_date:
+        return None
+    try:
+        parsed = parser.parse(due_date, fuzzy=True, default=datetime.datetime.now())
+        return parsed.date().isoformat()
+    except (ValueError, TypeError):
+        return due_date
+
+
 async def create_task(
     portal_id: str,
     project_id: str,
@@ -31,8 +44,9 @@ async def create_task(
     description: str | None = None,
 ) -> Any:
     payload: dict[str, Any] = {"name": title}
-    if due_date:
-        payload["end_date"] = due_date
+    normalized_due_date = normalize_due_date(due_date)
+    if normalized_due_date:
+        payload["end_date"] = normalized_due_date
     if assignee_id:
         payload["owner_id"] = assignee_id
     if description:
@@ -58,7 +72,7 @@ async def update_task(
     if assignee_id is not None:
         payload["owner_id"] = assignee_id
     if due_date is not None:
-        payload["end_date"] = due_date
+        payload["end_date"] = normalize_due_date(due_date)
     if priority is not None:
         payload["priority"] = priority
     if title is not None:
