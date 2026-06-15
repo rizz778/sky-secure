@@ -58,18 +58,20 @@ async def route_message(
     session_id: str | None = None,
     user_id: str | None = None,
 ) -> dict[str, Any]:
-    result = await router_graph.ainvoke(
-        {
-            "message": message,
-            "session_id": session_id or DEFAULT_SESSION_ID,
-            "user_id": user_id or DEFAULT_USER_ID,
-            "portal_id": portal_id,
-            "project_id": project_id,
-            "task_id": task_id,
-            "confirmation": confirmation,
-        }
-    )
-    return result["response"]
+    state = {
+        "message": message,
+        "session_id": session_id or DEFAULT_SESSION_ID,
+        "user_id": user_id or DEFAULT_USER_ID,
+        "portal_id": portal_id,
+        "project_id": project_id,
+        "task_id": task_id,
+        "confirmation": confirmation,
+    }
+    print("[router] route_message request:", json.dumps(state, default=str))
+    result = await router_graph.ainvoke(state)
+    response = result["response"]
+    print("[router] route_message response:", json.dumps({"agent": response.get("agent"), "routing_reason": response.get("routing_reason"), "tool_name": response.get("tool_name")}, default=str))
+    return response
 
 
 def is_task_id_placeholder(task_id: Any) -> bool:

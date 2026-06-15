@@ -197,6 +197,8 @@ async def execute_action(state: dict[str, Any]) -> dict[str, Any]:
     tool_output: Any = None
 
     if action_name == "create_task":
+        # create_task does not accept a task_id; ensure it's not passed
+        action_input.pop("task_id", None)
         tool_output = await create_task(**action_input)
     elif action_name == "update_task":
         tool_output = await update_task(**action_input)

@@ -1,8 +1,9 @@
+import os
 import time
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.auth.login import (
     ZOHO_CLIENT_ID,
@@ -56,15 +57,39 @@ async def callback(
     }
 
     async with httpx.AsyncClient(timeout=20) as client:
-        token_response = await client.post(token_url(accounts_server), params=token_payload)
+        try:
+            token_response = await client.post(token_url(accounts_server), data=token_payload)
+        except httpx.HTTPError as exc:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "Failed to contact Zoho token endpoint.",
+                    "details": str(exc),
+                },
+            )
 
-    if token_response.is_error:
-        raise HTTPException(
-            status_code=token_response.status_code,
-            detail=token_response.json(),
+    response_text = token_response.text
+    try:
+        tokens = token_response.json()
+    except ValueError:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "Invalid token response from Zoho",
+                "status_code": token_response.status_code,
+                "body": response_text,
+            },
         )
 
-    tokens = token_response.json()
+    if token_response.is_error:
+        return JSONResponse(
+            status_code=token_response.status_code,
+            content={
+                "error": "Zoho token endpoint returned an error",
+                "details": tokens,
+            },
+        )
+
     token_data = {
         "access_token": tokens.get("access_token"),
         "refresh_token": tokens.get("refresh_token"),
@@ -75,15 +100,12 @@ async def callback(
         "token_type": tokens.get("token_type"),
     }
     token_data["projects_api_domain"] = projects_api_domain(token_data)
-    saved_tokens = save_tokens(token_data)
-    response = {
-        "message": "Zoho authentication successful",
-        "api_domain": saved_tokens.get("api_domain"),
-        "expires_in": saved_tokens.get("expires_in"),
-        "token_type": saved_tokens.get("token_type"),
-        "refresh_token_present": bool(saved_tokens.get("refresh_token")),
-    }
-    return response
+    save_tokens(token_data)
+
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    redirect = RedirectResponse(f"{frontend_url}/chat", status_code=302)
+    redirect.headers["Cache-Control"] = "no-store"
+    return redirect
 
 
 @router.get("/auth/status")
