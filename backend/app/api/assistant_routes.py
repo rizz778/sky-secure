@@ -36,10 +36,10 @@ async def chat(request: ChatRequest):
             message=request.message,
             session_id=request.session_id,
             user_id=request.user_id,
-            portal_id=request.portal_id,
-            project_id=request.project_id,
-            task_id=request.task_id,
-            confirmation=request.confirmation,
+            # portal_id=request.portal_id,
+            # project_id=request.project_id,
+            # task_id=request.task_id,
+            # confirmation=request.confirmation,
         )
         logger.info("assistant/chat response generated: agent=%s routing_reason=%s", result.get("agent"), result.get("routing_reason"))
         return result

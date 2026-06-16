@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.assistant_routes import router as assistant_router
-from app.auth.routes import router as auth_router
+from app.api.auth_routes import router as auth_router
 
 app = FastAPI(title="Zoho Project Assistant")
 

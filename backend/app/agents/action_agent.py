@@ -12,253 +12,173 @@ from app.tools.zoho_agent_tools import create_task, delete_task, update_task
 load_dotenv()
 
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
-MAX_CONTEXT_CHARS = 8000
 
 
-def create_action_state(
-    message: str,
-    portal_id: str | None = None,
-    project_id: str | None = None,
-    task_id: str | None = None,
-    confirmed: bool | None = None,
-) -> dict[str, Any]:
-    return {
-        "message": message,
-        "portal_id": portal_id,
-        "project_id": project_id,
-        "task_id": task_id,
-        "action_name": None,
-        "action_input": None,
-        "confirmation_required": False,
-        "confirmation_prompt": None,
-        "confirmed": confirmed,
-        "tool_output": None,
-        "final_answer": None,
-    }
-
-
-def is_task_id_placeholder(task_id: Any) -> bool:
-    if not isinstance(task_id, str):
-        return False
-    normalized = task_id.strip().lower()
-    placeholders = {
-        "last",
-        "last_task",
-        "last_task_id",
-        "recent",
-        "recent_task",
-        "latest",
-        "latest_task",
-        "my_last_task",
-        "most_recent_task",
-        "this task",
-    }
-    if normalized in placeholders:
-        return True
-    return any(phrase in normalized for phrase in ["last", "recent", "latest"])
-
-
-def normalize_action_input(state: dict[str, Any]) -> dict[str, Any]:
-    action_input = dict(state.get("action_input") or {})
-    if state.get("portal_id") and "portal_id" not in action_input:
-        action_input["portal_id"] = state["portal_id"]
-    if state.get("project_id") and "project_id" not in action_input:
-        action_input["project_id"] = state["project_id"]
-
-    task_id_in_input = action_input.get("task_id")
-    resolved_task_id = state.get("task_id")
-    if task_id_in_input is not None and is_task_id_placeholder(task_id_in_input):
-        if resolved_task_id and not is_task_id_placeholder(resolved_task_id):
-            action_input["task_id"] = resolved_task_id
-        else:
-            action_input.pop("task_id", None)
-    elif task_id_in_input is None and resolved_task_id and not is_task_id_placeholder(resolved_task_id):
-        action_input["task_id"] = resolved_task_id
-
-    return {**state, "action_input": action_input}
+def parse_json_object(text: str) -> dict[str, Any]:
+    """Extract JSON from text, handling fenced code blocks."""
+    text = text.strip()
+    if not text:
+        return {}
+    
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    
+    try:
+        return json.loads(text) if isinstance(json.loads(text), dict) else {}
+    except ValueError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0)) if isinstance(json.loads(match.group(0)), dict) else {}
+            except ValueError:
+                pass
+    return {}
 
 
 def extract_task_id(tool_output: Any) -> str | None:
+    """Extract task ID from tool output."""
     if not isinstance(tool_output, dict):
         return None
-    body = tool_output.get("body")
-    if isinstance(body, dict):
-        task_id = body.get("id") or body.get("task_id") or (body.get("task") and body["task"].get("id"))
-        if isinstance(task_id, (int, str)):
-            return str(task_id)
-    return None
+    body = tool_output.get("body", {})
+    task_id = body.get("id") or body.get("task_id") or (body.get("task") or {}).get("id")
+    return str(task_id) if task_id else None
+
+
+def validate_action_input(action_name: str, action_input: dict[str, Any]) -> None:
+    """Validate required fields for action."""
+    required = {
+        "create_task": ["portal_id", "project_id", "title"],
+        "update_task": ["portal_id", "project_id", "task_id"],
+        "delete_task": ["portal_id", "project_id", "task_id"],
+    }.get(action_name, [])
+    
+    missing = [f for f in required if not action_input.get(f)]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required fields: {', '.join(missing)}",
+        )
+
+
+def format_history_context(session_memory: dict[str, Any]) -> str:
+    """Format history chains for LLM context."""
+    context = ""
+    
+    portals = session_memory.get("portals_history", [])
+    if portals:
+        context += "\n\nRecent portals:\n"
+        for i, p in enumerate(portals[:5], 1):
+            context += f"{i}. {p.get('name')} (ID: {p.get('id')})\n"
+    
+    projects = session_memory.get("projects_history", [])
+    if projects:
+        context += "\n\nRecent projects:\n"
+        for i, p in enumerate(projects[:5], 1):
+            context += f"{i}. {p.get('name')} (ID: {p.get('id')}, Portal: {p.get('portal_id')})\n"
+    
+    tasks = session_memory.get("tasks_history", [])
+    if tasks:
+        context += "\n\nRecent tasks:\n"
+        for i, t in enumerate(tasks[:5], 1):
+            context += f"{i}. {t.get('name')} (ID: {t.get('id')}, Project: {t.get('project_id')})\n"
+    
+    return context
 
 
 async def decide_action(state: dict[str, Any]) -> dict[str, Any]:
+    """LLM decides which action to take."""
     mistral_api_key = os.getenv("MISTRAL_API_KEY")
     if not mistral_api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing MISTRAL_API_KEY in backend/.env",
-        )
-
+        raise HTTPException(status_code=500, detail="Missing MISTRAL_API_KEY")
+    
+    session_memory = state.get("session_memory", {})
+    history_context = format_history_context(session_memory)
+    
     client = Mistral(api_key=mistral_api_key)
-    prompt = (
-        "Available actions:\n"
-        "- create_task(portal_id, project_id, title, due_date?, assignee_id?, description?)\n"
-        "- update_task(portal_id, project_id, task_id, status?, assignee_id?, due_date?, priority?, title?, description?)\n"
-        "- delete_task(portal_id, project_id, task_id)\n\n"
-        "Respond with valid JSON only, with these fields:\n"
-        "{\n"
-        "  \"action_name\": \"create_task\",\n"
-        "  \"action_input\": { ... }\n"
-        "}\n"
-        "Use the provided portal_id/project_id when available."
-    )
-
     response = await client.chat.complete_async(
         model=MISTRAL_MODEL,
         messages=[
             {
                 "role": "system",
-                "content": "You are a Zoho action assistant. Determine whether the user wants to create, update, or delete a task.\n" + prompt,
+                "content": (
+                    "You are a Zoho action assistant. Determine if user wants to create, update, or delete a task.\n"
+                    "Available actions:\n"
+                    "- create_task(portal_id, project_id, title, due_date?, assignee_id?, description?)\n"
+                    "- update_task(portal_id, project_id, task_id, status?, assignee_id?, due_date?, priority?, title?, description?)\n"
+                    "- delete_task(portal_id, project_id, task_id)\n\n"
+                    "Return JSON: {\"action_name\": \"...\", \"action_input\": {...}}\n"
+                    "Reference history items (e.g., '2nd project') or use explicit IDs."
+                    + history_context
+                ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"User question:\n{state['message']}\n\n"
-                    f"portal_id: {state.get('portal_id')}\n"
-                    f"project_id: {state.get('project_id')}\n"
-                    f"task_id: {state.get('task_id')}"
+                    f"Request: {state['message']}\n"
+                    f"Provided: portal_id={state.get('portal_id')}, "
+                    f"project_id={state.get('project_id')}, task_id={state.get('task_id')}"
                 ),
             },
         ],
     )
-
+    
     parsed = parse_json_object(response.choices[0].message.content)
     action_name = parsed.get("action_name")
     action_input = parsed.get("action_input", {}) if isinstance(parsed.get("action_input"), dict) else {}
-
+    
     if action_name not in {"create_task", "update_task", "delete_task"}:
-        action_name = None
-
-    state = {**state, "action_name": action_name, "action_input": action_input}
-    state = normalize_action_input(state)
-
-    confirmation_required = bool(action_name)
-    confirmation_prompt = None
-
-    if action_name == "create_task":
-        confirmation_prompt = (
-            f"I will create a task named '{state['action_input'].get('title')}' "
-            f"in project {state['action_input'].get('project_id')}. Confirm?"
-        )
-    elif action_name == "update_task":
-        confirmation_prompt = (
-            f"I will update task {state['action_input'].get('task_id')} "
-            f"with {state['action_input']}. Confirm?"
-        )
-    elif action_name == "delete_task":
-        confirmation_prompt = (
-            f"I will delete task {state['action_input'].get('task_id')}. This cannot be undone. Confirm?"
-        )
-
-    if action_name is None:
-        return {
-            **state,
-            "confirmation_required": False,
-            "final_answer": "I could not identify a valid Zoho action from your request.",
-        }
-
+        return {**state, "action_name": None, "confirmation_required": False, 
+                "final_answer": "Could not identify a valid action."}
+    
+    confirmation_prompts = {
+        "create_task": f"Create task '{action_input.get('title')}' in project {action_input.get('project_id')}?",
+        "update_task": f"Update task {action_input.get('task_id')}?",
+        "delete_task": f"Delete task {action_input.get('task_id')}? (Cannot be undone)",
+    }
+    
     return {
         **state,
-        "confirmation_required": confirmation_required,
-        "confirmation_prompt": confirmation_prompt,
+        "action_name": action_name,
+        "action_input": action_input,
+        "confirmation_required": True,
+        "confirmation_prompt": confirmation_prompts.get(action_name),
     }
 
 
 async def execute_action(state: dict[str, Any]) -> dict[str, Any]:
+    """Execute the decided action."""
     action_name = state.get("action_name")
+    
     if not action_name:
-        return {
-            **state,
-            "final_answer": "No action could be determined for this request.",
-        }
-
+        return {**state, "final_answer": "No action to execute."}
+    
     if state.get("confirmation_required") and state.get("confirmed") is not True:
-        return {
-            **state,
-            "final_answer": state.get("confirmation_prompt") or "Please confirm the intended action before I execute it.",
-        }
-
+        return {**state, "final_answer": state.get("confirmation_prompt") or "Awaiting confirmation."}
+    
     if state.get("confirmed") is False:
-        return {
-            **state,
-            "final_answer": "Action has been cancelled.",
-        }
-
-    action_input = state.get("action_input") or {}
+        return {**state, "final_answer": "Action cancelled."}
+    
+    action_input = state.get("action_input", {})
     validate_action_input(action_name, action_input)
-    tool_output: Any = None
-
+    
     if action_name == "create_task":
-        # create_task does not accept a task_id; ensure it's not passed
         action_input.pop("task_id", None)
-        tool_output = await create_task(**action_input)
+        output = await create_task(**action_input)
+        task_id = extract_task_id(output)
     elif action_name == "update_task":
-        tool_output = await update_task(**action_input)
-    elif action_name == "delete_task":
-        tool_output = await delete_task(**action_input)
-    else:
-        raise HTTPException(status_code=400, detail="Unknown action")
-
-    task_id = state.get("action_input", {}).get("task_id")
-    if action_name == "create_task":
-        task_id = extract_task_id(tool_output) or task_id
-
+        output = await update_task(**action_input)
+        task_id = action_input.get("task_id")
+    else:  # delete_task
+        output = await delete_task(**action_input)
+        task_id = action_input.get("task_id")
+    
     return {
         **state,
-        "tool_output": tool_output,
+        "tool_output": output,
         "task_id": task_id,
         "final_answer": f"Action '{action_name}' completed successfully.",
     }
-
-
-def validate_action_input(action_name: str, action_input: dict[str, Any]) -> None:
-    required_fields = {
-        "create_task": ["portal_id", "project_id", "title"],
-        "update_task": ["portal_id", "project_id", "task_id"],
-        "delete_task": ["portal_id", "project_id", "task_id"],
-    }[action_name]
-
-    missing = [field for field in required_fields if not action_input.get(field)]
-    if missing:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": f"Missing required action input: {', '.join(missing)}",
-                "action_name": action_name,
-                "action_input": action_input,
-            },
-        )
-
-
-def parse_json_object(text: str) -> dict[str, Any]:
-    text = text.strip()
-    if not text:
-        return {}
-
-    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fenced_match:
-        text = fenced_match.group(1)
-
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else {}
-    except ValueError:
-        object_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not object_match:
-            return {}
-        try:
-            parsed = json.loads(object_match.group(0))
-            return parsed if isinstance(parsed, dict) else {}
-        except ValueError:
-            return {}
 
 
 async def run_action_agent(
@@ -267,10 +187,21 @@ async def run_action_agent(
     project_id: str | None = None,
     task_id: str | None = None,
     confirmation: bool | None = None,
+    session_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    state = create_action_state(message, portal_id=portal_id, project_id=project_id, task_id=task_id, confirmed=confirmation)
+    """Run action agent: decide -> execute -> return result."""
+    state = {
+        "message": message,
+        "portal_id": portal_id,
+        "project_id": project_id,
+        "task_id": task_id,
+        "session_memory": session_memory or {},
+        "confirmed": confirmation,
+    }
+    
     result = await decide_action(state)
     result = await execute_action(result)
+    
     return {
         "answer": result.get("final_answer"),
         "portal_id": result.get("portal_id"),

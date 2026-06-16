@@ -22,15 +22,176 @@ QUERY_TOOLS = {
 }
 
 
+def parse_json_object(text: str) -> dict[str, Any]:
+    """Extract JSON from text, handling fenced code blocks."""
+    text = text.strip()
+    if not text:
+        return {}
+    
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    
+    try:
+        return json.loads(text) if isinstance(json.loads(text), dict) else {}
+    except ValueError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0)) if isinstance(json.loads(match.group(0)), dict) else {}
+            except ValueError:
+                pass
+    return {}
+
+
+def validate_tool_input(tool_name: str, tool_input: dict[str, Any]) -> None:
+    """Validate required fields for tool."""
+    required = {
+        "list_portals": [],
+        "list_projects": ["portal_id"],
+        "list_tasks": ["portal_id", "project_id"],
+    }.get(tool_name, [])
+    
+    missing = [f for f in required if not tool_input.get(f)]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing: {', '.join(missing)}")
+
+
+def format_history_context(session_memory: dict[str, Any]) -> str:
+    """Format history chains for LLM context."""
+    context = ""
+    
+    portals = session_memory.get("portals_history", [])
+    if portals:
+        context += "\n\nRecent portals:\n"
+        for i, p in enumerate(portals[:5], 1):
+            context += f"{i}. {p.get('name')} (ID: {p.get('id')})\n"
+    
+    projects = session_memory.get("projects_history", [])
+    if projects:
+        context += "\n\nRecent projects:\n"
+        for i, p in enumerate(projects[:5], 1):
+            context += f"{i}. {p.get('name')} (ID: {p.get('id')}, Portal: {p.get('portal_id')})\n"
+    
+    tasks = session_memory.get("tasks_history", [])
+    if tasks:
+        context += "\n\nRecent tasks:\n"
+        for i, t in enumerate(tasks[:5], 1):
+            context += f"{i}. {t.get('name')} (ID: {t.get('id')}, Project: {t.get('project_id')})\n"
+    
+    return context
+
+
+def get_mistral_client() -> Mistral:
+    """Get Mistral client, raise if API key missing."""
+    key = os.getenv("MISTRAL_API_KEY")
+    if not key:
+        raise HTTPException(status_code=500, detail="Missing MISTRAL_API_KEY")
+    return Mistral(api_key=key)
+
+
+async def decide_query_tool(
+    message: str,
+    portal_id: str | None = None,
+    project_id: str | None = None,
+    session_memory: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """LLM decides which query tool to use."""
+    session_memory = session_memory or {}
+    history_context = format_history_context(session_memory)
+    
+    client = get_mistral_client()
+    response = await client.chat.complete_async(
+        model=MISTRAL_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Route user questions to read-only Zoho tools.\n"
+                    "Available:\n"
+                    "- list_portals(): list portals.\n"
+                    "- list_projects(portal_id): list projects in portal.\n"
+                    "- list_tasks(portal_id, project_id): list tasks.\n\n"
+                    "Return JSON: {\"tool_name\": \"...\", \"tool_input\": {...}}\n"
+                    "Reference history items (e.g., '2nd project') or use explicit IDs."
+                    + history_context
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Request: {message}\n"
+                    f"Provided: portal_id={portal_id}, project_id={project_id}"
+                ),
+            },
+        ],
+    )
+    
+    parsed = parse_json_object(response.choices[0].message.content)
+    tool_name = parsed.get("tool_name") or "list_portals"
+    
+    if tool_name not in QUERY_TOOLS:
+        tool_name = "list_portals"
+    
+    tool_input = parsed.get("tool_input", {}) if isinstance(parsed.get("tool_input"), dict) else {}
+    validate_tool_input(tool_name, tool_input)
+    return tool_name, tool_input
+
+
+async def execute_query_tool(tool_name: str, tool_input: dict[str, Any]) -> Any:
+    """Execute the query tool."""
+    if tool_name not in QUERY_TOOLS:
+        raise HTTPException(status_code=400, detail=f"Unknown tool: {tool_name}")
+    return await QUERY_TOOLS[tool_name](**tool_input)
+
+
+async def answer_from_tool_output(
+    message: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    tool_output: Any,
+    session_memory: dict[str, Any] | None = None,
+) -> str:
+    """LLM generates answer from tool output."""
+    client = get_mistral_client()
+    output_text = json.dumps(tool_output, indent=2, default=str)[:MAX_TOOL_OUTPUT_CHARS]
+    
+    response = await client.chat.complete_async(
+        model=MISTRAL_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a Zoho assistant. Answer only from tool output. Keep answers concise.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Request: {message}\n\n"
+                    f"Tool: {tool_name}\n"
+                    f"Input: {json.dumps(tool_input, default=str)}\n"
+                    f"Output:\n{output_text}"
+                ),
+            },
+        ],
+    )
+    return response.choices[0].message.content or ""
+
+
 async def run_query_agent(
     message: str,
     portal_id: str | None = None,
     project_id: str | None = None,
+    session_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    tool_name, tool_input = await decide_query_tool(message, portal_id, project_id)
+    """Run query agent: decide tool -> execute -> generate answer."""
+    tool_name, tool_input = await decide_query_tool(
+        message, portal_id, project_id, session_memory=session_memory or {}
+    )
     tool_output = await execute_query_tool(tool_name, tool_input)
-    answer = await answer_from_tool_output(message, tool_name, tool_input, tool_output)
-
+    answer = await answer_from_tool_output(
+        message, tool_name, tool_input, tool_output, session_memory=session_memory or {}
+    )
+    
     return {
         "answer": answer,
         "portal_id": tool_input.get("portal_id") or portal_id,
@@ -41,158 +202,3 @@ async def run_query_agent(
         "projects": tool_output if tool_name == "list_projects" else None,
         "tasks": tool_output if tool_name == "list_tasks" else None,
     }
-
-
-async def decide_query_tool(
-    message: str,
-    portal_id: str | None = None,
-    project_id: str | None = None,
-) -> tuple[str, dict[str, Any]]:
-    client = mistral_client()
-    response = await client.chat.complete_async(
-        model=MISTRAL_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You route user questions to read-only Zoho tools. "
-                    "Never choose create, update, or delete actions. "
-                    "Return valid JSON only with {\"tool_name\":\"list_tasks\",\"tool_input\":{\"portal_id\":\"...\",\"project_id\":\"...\"}}"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Choose the best Zoho read tool for this request.\n\n"
-                    "Tools:\n"
-                    "- list_portals(): list available portals.\n"
-                    "- list_projects(portal_id): list projects in a portal.\n"
-                    "- list_tasks(portal_id, project_id): list tasks in a project.\n\n"
-                    f"User request: {message}\n"
-                    f"Known portal_id: {portal_id}\n"
-                    f"Known project_id: {project_id}"
-                ),
-            },
-        ],
-    )
-
-    parsed = parse_json_object(response.choices[0].message.content)
-    tool_name = parsed.get("tool_name") or fallback_tool_name(message)
-    if tool_name not in QUERY_TOOLS:
-        tool_name = fallback_tool_name(message)
-
-    tool_input = parsed.get("tool_input") if isinstance(parsed.get("tool_input"), dict) else {}
-    tool_input = fill_known_ids(tool_name, tool_input, portal_id, project_id)
-    validate_query_tool_input(tool_name, tool_input)
-    return tool_name, tool_input
-
-
-async def execute_query_tool(tool_name: str, tool_input: dict[str, Any]) -> Any:
-    if tool_name not in QUERY_TOOLS:
-        raise HTTPException(status_code=400, detail=f"Unknown query tool: {tool_name}")
-    return await QUERY_TOOLS[tool_name](**tool_input)
-
-
-async def answer_from_tool_output(
-    message: str,
-    tool_name: str,
-    tool_input: dict[str, Any],
-    tool_output: Any,
-) -> str:
-    client = mistral_client()
-    tool_output_text = json.dumps(tool_output, indent=2, default=str)[:MAX_TOOL_OUTPUT_CHARS]
-
-    response = await client.chat.complete_async(
-        model=MISTRAL_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a Zoho Project Assistant. Answer only from the tool output. "
-                    "If an ID is missing, ask for it clearly. Keep answers concise and practical."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"User request:\n{message}\n\n"
-                    f"Tool used: {tool_name}\n"
-                    f"Tool input: {json.dumps(tool_input, default=str)}\n"
-                    f"Tool output JSON:\n{tool_output_text}"
-                ),
-            },
-        ],
-    )
-    return response.choices[0].message.content or ""
-
-
-def fill_known_ids(
-    tool_name: str,
-    tool_input: dict[str, Any],
-    portal_id: str | None,
-    project_id: str | None,
-) -> dict[str, Any]:
-    hydrated = dict(tool_input)
-    if tool_name in {"list_projects", "list_tasks"} and portal_id:
-        hydrated.setdefault("portal_id", portal_id)
-    if tool_name == "list_tasks" and project_id:
-        hydrated.setdefault("project_id", project_id)
-    return hydrated
-
-
-def validate_query_tool_input(tool_name: str, tool_input: dict[str, Any]) -> None:
-    required = {
-        "list_portals": [],
-        "list_projects": ["portal_id"],
-        "list_tasks": ["portal_id", "project_id"],
-    }[tool_name]
-
-    missing = [field for field in required if not tool_input.get(field)]
-    if missing:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": f"Missing required tool input: {', '.join(missing)}",
-                "tool_name": tool_name,
-                "tool_input": tool_input,
-            },
-        )
-
-
-def fallback_tool_name(message: str) -> str:
-    normalized = message.lower()
-    if any(word in normalized for word in ("task", "todo", "deadline", "due")):
-        return "list_tasks"
-    if "project" in normalized:
-        return "list_projects"
-    return "list_portals"
-
-
-def parse_json_object(text: str) -> dict[str, Any]:
-    text = text.strip()
-    if not text:
-        return {}
-
-    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fenced_match:
-        text = fenced_match.group(1)
-
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else {}
-    except ValueError:
-        object_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not object_match:
-            return {}
-        try:
-            parsed = json.loads(object_match.group(0))
-            return parsed if isinstance(parsed, dict) else {}
-        except ValueError:
-            return {}
-
-
-def mistral_client():
-    mistral_api_key = os.getenv("MISTRAL_API_KEY")
-    if not mistral_api_key:
-        raise HTTPException(status_code=500, detail="Missing MISTRAL_API_KEY in backend/.env")
-    return Mistral(api_key=mistral_api_key)

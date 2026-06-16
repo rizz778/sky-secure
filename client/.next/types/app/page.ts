@@ -1,4 +1,4 @@
-// File: C:\Users\SUVIR ARORA\OneDrive\Documents\sky-secure\sky-secure\client\app\page.tsx
+// File: /home/suvirarora/Documents/pproj/sky-secure/client/app/page.tsx
 import * as entry from '../../../app/page.js'
 import type { ResolvingMetadata, ResolvingViewport } from 'next/dist/lib/metadata/types/metadata-interface.js'
 
